@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize;
 use spinners::{Spinner, Spinners};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use toml_edit::{Document, DocumentMut, InlineTable, Item, Table, Value};
 use walkdir::WalkDir;
 
 const IGNORED_DIRS: &[&str] = &["target", ".git", "node_modules", "tools"];
-const STRIPPED_KEYS: &[&str] = &["path", "version", "git", "branch", "tag", "rev", "registry"];
+const STRIPPED_KEYS: &[&str] = &["path", "version", "git", "branch", "tag", "rev", "registry", "default-features"];
 const ROOT_DEP_KEYS: &[&str] = &["version", "git", "branch", "tag", "rev", "registry", "package", "features", "default-features", "optional", "default-features"];
 
 #[derive(Parser)]
@@ -79,10 +79,10 @@ fn main() -> Result<()> {
     let mut spinner = Spinner::new(Spinners::Dots9, "Scanning Cargo.toml files...".into());
     let manifests = collect_workspace_manifests(&root)?;
     let root_doc = load_document(&root_manifest)?;
-    let local_package_names = collect_local_package_names(&manifests, &root_manifest)?;
-    let workspace_dep_names = collect_workspace_dependency_names(&root_doc);
+    let local_packages = collect_local_packages(&manifests, &root_manifest)?;
+    let workspace_deps = collect_workspace_dependencies(&root_doc);
     let dep_usages = collect_dependency_usages(&manifests, &root_manifest)?;
-    let fixes = analyze_fixes(&dep_usages, &workspace_dep_names, &local_package_names);
+    let fixes = analyze_fixes(&dep_usages, &workspace_deps, &local_packages, &root);
     spinner.stop();
 
     print_summary(&fixes);
@@ -132,28 +132,38 @@ fn load_document(path: &Path) -> Result<Document<String>> {
         .with_context(|| format!("Failed to parse {}", path.display()))
 }
 
-fn collect_local_package_names(manifests: &[PathBuf], root_manifest: &Path) -> Result<BTreeSet<String>> {
-    let mut names = BTreeSet::new();
+fn collect_local_packages(manifests: &[PathBuf], root_manifest: &Path) -> Result<BTreeMap<String, PathBuf>> {
+    let mut packages = BTreeMap::new();
     for manifest in manifests {
         if manifest == root_manifest {
             continue;
         }
         let doc = load_document(manifest)?;
-        if let Some(name) = doc["package"]["name"].as_str() {
-            names.insert(name.to_string());
+        if let Some(name) = doc
+            .get("package")
+            .and_then(Item::as_table)
+            .and_then(|package| package.get("name"))
+            .and_then(Item::as_str)
+        {
+            packages.insert(name.to_string(), manifest.clone());
         }
     }
-    Ok(names)
+    Ok(packages)
 }
 
-fn collect_workspace_dependency_names(root_doc: &Document<String>) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    if let Some(table) = root_doc["workspace"]["dependencies"].as_table() {
-        for (key, _) in table.iter() {
-            names.insert(key.to_string());
+fn collect_workspace_dependencies(root_doc: &Document<String>) -> BTreeMap<String, Item> {
+    let mut dependencies = BTreeMap::new();
+    if let Some(table) = root_doc
+        .get("workspace")
+        .and_then(Item::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(Item::as_table)
+    {
+        for (key, item) in table.iter() {
+            dependencies.insert(key.to_string(), item.clone());
         }
     }
-    names
+    dependencies
 }
 
 fn collect_dependency_usages(manifests: &[PathBuf], root_manifest: &Path) -> Result<HashMap<String, Vec<DepUsage>>> {
@@ -171,12 +181,12 @@ fn collect_dependency_usages(manifests: &[PathBuf], root_manifest: &Path) -> Res
 fn collect_dependencies_in_document(doc: &Document<String>, manifest: &Path, usage_map: &mut HashMap<String, Vec<DepUsage>>) {
     let top_sections = ["dependencies", "dev-dependencies", "build-dependencies"];
     for section in top_sections {
-        if let Some(table) = doc[section].as_table() {
+        if let Some(table) = doc.get(section).and_then(Item::as_table) {
             collect_dependencies_in_table(table, manifest, vec![section.to_string()], usage_map);
         }
     }
 
-    if let Some(target_table) = doc["target"].as_table() {
+    if let Some(target_table) = doc.get("target").and_then(Item::as_table) {
         for (target_name, target_item) in target_table.iter() {
             if let Some(target_section) = target_item.as_table() {
                 for section in top_sections {
@@ -257,25 +267,70 @@ fn item_has_version(item: &Item) -> bool {
 
 fn analyze_fixes(
     dep_usages: &HashMap<String, Vec<DepUsage>>,
-    root_workspace_names: &BTreeSet<String>,
-    local_package_names: &BTreeSet<String>,
+    root_workspace_deps: &BTreeMap<String, Item>,
+    local_packages: &BTreeMap<String, PathBuf>,
+    root_dir: &Path,
 ) -> FixPlan {
     let mut plan = FixPlan::default();
 
     for (name, usages) in dep_usages {
+        let root_workspace_dep = root_workspace_deps.get(name);
+        let has_root_workspace_dep = root_workspace_dep.is_some();
+        let local_manifest = local_packages.get(name);
         if usages.len() < 2 {
+            if !has_root_workspace_dep && usages.iter().any(|usage| usage.is_workspace) {
+                if let Some(local_manifest) = local_manifest {
+                    push_root_addition(
+                        &mut plan,
+                        name,
+                        build_local_workspace_root_entry(root_dir, local_manifest),
+                    );
+                }
+            }
             continue;
         }
 
         let non_workspace_usages: Vec<_> = usages.iter().filter(|usage| !usage.is_workspace).collect();
         if non_workspace_usages.is_empty() {
+            if !has_root_workspace_dep {
+                if let Some(local_manifest) = local_manifest {
+                    push_root_addition(
+                        &mut plan,
+                        name,
+                        build_local_workspace_root_entry(root_dir, local_manifest),
+                    );
+                }
+            }
             continue;
         }
 
-        let available_as_workspace = root_workspace_names.contains(name) || local_package_names.contains(name);
+        if !has_root_workspace_dep {
+            if let Some(local_manifest) = local_manifest {
+                push_root_addition(
+                    &mut plan,
+                    name,
+                    build_local_workspace_root_entry(root_dir, local_manifest),
+                );
 
-        if available_as_workspace {
+                for usage in &non_workspace_usages {
+                    let new_item = build_workspace_child_item(usage);
+                    plan.child_fixes.push(ChildFix {
+                        manifest: usage.manifest.clone(),
+                        section_path: usage.section_path.clone(),
+                        name: usage.name.clone(),
+                        new_item,
+                    });
+                }
+                continue;
+            }
+        }
+
+        if has_root_workspace_dep {
+            let root_workspace_dep = root_workspace_dep.expect("workspace dependency should exist");
             for usage in &non_workspace_usages {
+                if !can_inherit_from_workspace_dep(usage, root_workspace_dep) {
+                    continue;
+                }
                 let new_item = build_workspace_child_item(usage);
                 plan.child_fixes.push(ChildFix {
                     manifest: usage.manifest.clone(),
@@ -284,6 +339,13 @@ fn analyze_fixes(
                     new_item,
                 });
             }
+            continue;
+        }
+
+        if !non_workspace_usages
+            .iter()
+            .all(|usage| can_share_workspace_dependency(usage, non_workspace_usages[0]))
+        {
             continue;
         }
 
@@ -305,6 +367,61 @@ fn analyze_fixes(
     }
 
     plan
+}
+
+fn can_inherit_from_workspace_dep(usage: &DepUsage, root_item: &Item) -> bool {
+    if let Some(default_features) = item_default_features(&usage.item) {
+        return default_features == item_effective_default_features(root_item);
+    }
+
+    true
+}
+
+fn can_share_workspace_dependency(left: &DepUsage, right: &DepUsage) -> bool {
+    item_default_features(&left.item) == item_default_features(&right.item)
+}
+
+fn item_default_features(item: &Item) -> Option<bool> {
+    if !item_has_key(item, "default-features") {
+        return None;
+    }
+
+    if let Some(table) = item.as_table() {
+        return get_bool_key(table, "default-features");
+    }
+    if let Some(value) = item.as_value() {
+        if let Some(inline) = value.as_inline_table() {
+            return get_bool_key(inline, "default-features");
+        }
+    }
+
+    None
+}
+
+fn item_effective_default_features(item: &Item) -> bool {
+    item_default_features(item).unwrap_or(true)
+}
+
+fn push_root_addition(plan: &mut FixPlan, name: &str, item: Item) {
+    if plan.root_additions.iter().any(|addition| addition.name == name) {
+        return;
+    }
+
+    plan.root_additions.push(RootAddition {
+        name: name.to_string(),
+        item,
+    });
+}
+
+fn build_local_workspace_root_entry(root_dir: &Path, manifest: &Path) -> Item {
+    let local_dir = manifest.parent().unwrap_or(root_dir);
+    let relative_path = local_dir.strip_prefix(root_dir).unwrap_or(local_dir);
+
+    let mut inline = InlineTable::new();
+    inline.insert("path", Value::from(relative_path.to_string_lossy().to_string()));
+    inline.fmt();
+
+    Item::Value(Value::InlineTable(inline))
 }
 
 fn build_root_workspace_child_entry(usage: &DepUsage) -> Option<Item> {
@@ -424,9 +541,25 @@ fn prompt_apply() -> Result<()> {
 
 fn apply_fixes(root_manifest: &Path, plan: FixPlan) -> Result<()> {
     let mut root_doc = load_document(root_manifest)?.into_mut();
-    let workspace_deps = root_doc["workspace"]["dependencies"].or_insert(Item::Table(Table::new()));
-    let root_table = workspace_deps
+    if !root_doc.as_table().contains_key("workspace") {
+        root_doc["workspace"] = Item::Table(Table::new());
+    }
+
+    let workspace = root_doc
         .as_table_mut()
+        .get_mut("workspace")
+        .context("Failed to access workspace table")?;
+    let workspace_table = workspace
+        .as_table_mut()
+        .context("Root workspace entry is not a table")?;
+
+    if !workspace_table.contains_key("dependencies") {
+        workspace_table["dependencies"] = Item::Table(Table::new());
+    }
+
+    let root_table = workspace_table
+        .get_mut("dependencies")
+        .and_then(Item::as_table_mut)
         .context("Failed to create workspace.dependencies table")?;
 
     for addition in &plan.root_additions {
