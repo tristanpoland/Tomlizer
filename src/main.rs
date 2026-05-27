@@ -43,9 +43,6 @@ struct DepUsage {
     name: String,
     item: Item,
     is_workspace: bool,
-    has_path: bool,
-    has_version: bool,
-    has_git: bool,
 }
 
 #[derive(Debug)]
@@ -184,7 +181,7 @@ fn collect_dependencies_in_document(doc: &Document<String>, manifest: &Path, usa
             if let Some(target_section) = target_item.as_table() {
                 for section in top_sections {
                     if let Some(target_deps) = target_section[section].as_table() {
-                        let mut path = vec![
+                        let path = vec![
                             "target".to_string(),
                             target_name.to_string(),
                             section.to_string(),
@@ -210,9 +207,6 @@ fn collect_dependencies_in_table(
             name: dep_name.to_string(),
             item: dep_item.clone(),
             is_workspace: is_workspace_dependency(dep_item),
-            has_path: item_has_key(dep_item, "path"),
-            has_version: item_has_version(dep_item),
-            has_git: item_has_key(dep_item, "git"),
         };
         usage_map.entry(usage.name.clone()).or_default().push(usage);
     }
