@@ -180,7 +180,7 @@ fn collect_dependencies_in_document(doc: &Document<String>, manifest: &Path, usa
         for (target_name, target_item) in target_table.iter() {
             if let Some(target_section) = target_item.as_table() {
                 for section in top_sections {
-                    if let Some(target_deps) = target_section[section].as_table() {
+                    if let Some(target_deps) = target_section.get(section).and_then(Item::as_table) {
                         let path = vec![
                             "target".to_string(),
                             target_name.to_string(),
