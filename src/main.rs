@@ -1,12 +1,12 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use colors::Style;
+use owo_colors::OwoColorize;
 use spinners::{Spinner, Spinners};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use toml_edit::{value, Document, InlineTable, Item, Table, Value};
+use toml_edit::{Document, DocumentMut, InlineTable, Item, Table, Value};
 use walkdir::WalkDir;
 
 const IGNORED_DIRS: &[&str] = &["target", ".git", "node_modules", "tools"];
@@ -79,7 +79,7 @@ fn main() -> Result<()> {
         bail!("Root Cargo.toml not found at {}", root_manifest.display());
     }
 
-    let spinner = Spinner::new(Spinners::Dots9, "Scanning Cargo.toml files...".into());
+    let mut spinner = Spinner::new(Spinners::Dots9, "Scanning Cargo.toml files...".into());
     let manifests = collect_workspace_manifests(&root)?;
     let root_doc = load_document(&root_manifest)?;
     let local_package_names = collect_local_package_names(&manifests, &root_manifest)?;
@@ -102,7 +102,7 @@ fn main() -> Result<()> {
                 prompt_apply()?;
             }
 
-            let apply_spinner = Spinner::new(Spinners::Dots9, "Applying fixes...".into());
+            let mut apply_spinner = Spinner::new(Spinners::Dots9, "Applying fixes...".into());
             apply_fixes(&root_manifest, fixes)?;
             apply_spinner.stop();
             println!("{}", "Applied workspace fixes.".green());
@@ -128,10 +128,10 @@ fn collect_workspace_manifests(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(manifests)
 }
 
-fn load_document(path: &Path) -> Result<Document> {
+fn load_document(path: &Path) -> Result<Document<String>> {
     let content = fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
     content
-        .parse::<Document>()
+        .parse::<Document<String>>()
         .with_context(|| format!("Failed to parse {}", path.display()))
 }
 
@@ -149,7 +149,7 @@ fn collect_local_package_names(manifests: &[PathBuf], root_manifest: &Path) -> R
     Ok(names)
 }
 
-fn collect_workspace_dependency_names(root_doc: &Document) -> BTreeSet<String> {
+fn collect_workspace_dependency_names(root_doc: &Document<String>) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     if let Some(table) = root_doc["workspace"]["dependencies"].as_table() {
         for (key, _) in table.iter() {
@@ -171,7 +171,7 @@ fn collect_dependency_usages(manifests: &[PathBuf], root_manifest: &Path) -> Res
     Ok(usage_map)
 }
 
-fn collect_dependencies_in_document(doc: &Document, manifest: &Path, usage_map: &mut HashMap<String, Vec<DepUsage>>) {
+fn collect_dependencies_in_document(doc: &Document<String>, manifest: &Path, usage_map: &mut HashMap<String, Vec<DepUsage>>) {
     let top_sections = ["dependencies", "dev-dependencies", "build-dependencies"];
     for section in top_sections {
         if let Some(table) = doc[section].as_table() {
@@ -315,17 +315,14 @@ fn analyze_fixes(
 
 fn build_root_workspace_child_entry(usage: &DepUsage) -> Option<Item> {
     if let Some(value) = usage.item.as_value().and_then(Value::as_str) {
-        return Some(Item::Value(Value::String(value.into())));
+        return Some(Item::Value(Value::from(value.to_string())));
     }
 
     let mut inline = InlineTable::new();
-    if let Some(input_table) = extract_table_like(&usage.item) {
-        for (key, item) in input_table.iter() {
-            let key = key.get();
-            if ROOT_DEP_KEYS.contains(&key) {
-                if let Ok(value) = item.clone().into_value() {
-                    inline.insert(key.to_string(), value);
-                }
+    for (key, item) in dependency_item_pairs(&usage.item) {
+        if ROOT_DEP_KEYS.contains(&key.as_str()) {
+            if let Ok(value) = item.clone().into_value() {
+                inline.insert(key, value);
             }
         }
     }
@@ -340,20 +337,17 @@ fn build_root_workspace_child_entry(usage: &DepUsage) -> Option<Item> {
 
 fn build_workspace_child_item(usage: &DepUsage) -> Item {
     let mut inline = InlineTable::new();
-    inline.insert("workspace", value(true));
+    inline.insert("workspace", Value::from(true));
 
-    if let Some(input_table) = extract_table_like(&usage.item) {
-        for (key, item) in input_table.iter() {
-            let key = key.get();
-            if STRIPPED_KEYS.contains(&key) {
-                continue;
-            }
-            if key == "workspace" {
-                continue;
-            }
-            if let Ok(value) = item.clone().into_value() {
-                inline.insert(key.to_string(), value);
-            }
+    for (key, item) in dependency_item_pairs(&usage.item) {
+        if STRIPPED_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        if key == "workspace" {
+            continue;
+        }
+        if let Ok(value) = item.clone().into_value() {
+            inline.insert(key, value);
         }
     }
 
@@ -361,18 +355,22 @@ fn build_workspace_child_item(usage: &DepUsage) -> Item {
     Item::Value(Value::InlineTable(inline))
 }
 
-fn extract_table_like(item: &Item) -> Option<&Table> {
+fn dependency_item_pairs(item: &Item) -> Vec<(String, Item)> {
     if let Some(table) = item.as_table() {
-        Some(table)
-    } else if let Some(value) = item.as_value() {
-        if let Some(inline) = value.as_inline_table() {
-            inline.as_table()
-        } else {
-            None
-        }
-    } else {
-        None
+        return table
+            .iter()
+            .map(|(key, item)| (key.to_string(), item.clone()))
+            .collect();
     }
+    if let Some(value) = item.as_value() {
+        if let Some(inline) = value.as_inline_table() {
+            return inline
+                .iter()
+                .map(|(key, value)| (key.to_string(), Item::Value(value.clone())))
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 fn print_summary(plan: &FixPlan) {
@@ -414,7 +412,7 @@ fn print_summary(plan: &FixPlan) {
 
     println!(
         "{}",
-        "Run `cargo run --manifest-path tools/tomlizer/Cargo.toml -- apply` to apply these changes.".dim()
+        "Run `cargo run --manifest-path tools/tomlizer/Cargo.toml -- apply` to apply these changes.".dimmed()
     );
 }
 
@@ -431,7 +429,7 @@ fn prompt_apply() -> Result<()> {
 }
 
 fn apply_fixes(root_manifest: &Path, plan: FixPlan) -> Result<()> {
-    let mut root_doc = load_document(root_manifest)?;
+    let mut root_doc = load_document(root_manifest)?.into_mut();
     let workspace_deps = root_doc["workspace"]["dependencies"].or_insert(Item::Table(Table::new()));
     let root_table = workspace_deps
         .as_table_mut()
@@ -455,7 +453,7 @@ fn apply_fixes(root_manifest: &Path, plan: FixPlan) -> Result<()> {
     }
 
     for (manifest, fixes) in grouped {
-        let mut doc = load_document(&manifest)?;
+        let mut doc = load_document(&manifest)?.into_mut();
         for fix in fixes {
             set_dependency_item(&mut doc, &fix.section_path, &fix.name, fix.new_item.clone())?;
         }
@@ -466,16 +464,16 @@ fn apply_fixes(root_manifest: &Path, plan: FixPlan) -> Result<()> {
     Ok(())
 }
 
-fn set_dependency_item(doc: &mut Document, section_path: &[String], dep_name: &str, new_item: Item) -> Result<()> {
+fn set_dependency_item(doc: &mut DocumentMut, section_path: &[String], dep_name: &str, new_item: Item) -> Result<()> {
     if section_path.is_empty() {
-        bail!("Empty section path when setting dependency {}");
+        bail!("Empty section path when setting dependency {}", dep_name);
     }
 
     let mut current: &mut Item = doc.as_item_mut();
     for segment in section_path {
         current = current
             .as_table_mut()
-            .and_then(|table| table.entry(segment).or_insert(Item::Table(Table::new())))
+            .map(|table: &mut Table| table.entry(segment).or_insert(Item::Table(Table::new())))
             .context("Failed to navigate to dependency section")?;
     }
     current.as_table_mut().context("Dependency section is not a table")?[dep_name] = new_item;
